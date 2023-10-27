@@ -64,6 +64,8 @@ pub struct Location {
     pub node_name: Option<String>,
     pub namespace: Option<String>,
     pub pod_name: Option<String>,
+    pub app_name: Option<String>,
+    pub container_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -289,9 +291,9 @@ fn push_resources(
             location: location.clone(),
         });
     }
-    // add a "pods" resource as well
+    // add a "containers" resource as well
     resources.push(Resource {
-        kind: "pods".to_string(),
+        kind: "containers".to_string(),
         qualifier,
         quantity: Qty::from_str("1")?,
         location: location.clone(),
@@ -349,24 +351,40 @@ pub async fn extract_allocatable_from_pods(
         let spec = pod.spec.as_ref();
         let node_name = spec.and_then(|s| s.node_name.clone());
         let metadata = &pod.metadata;
-        let location = Location {
-            node_name: node_name.clone(),
-            namespace: metadata.namespace.clone(),
-            pod_name: metadata.name.clone(),
-        };
-        // compute the effective resource qualifier
-        // see https://kubernetes.io/docs/concepts/workloads/pods/init-containers/#resources
-        let mut resource_requests: BTreeMap<String, Qty> = BTreeMap::new();
-        let mut resource_limits: BTreeMap<String, Qty> = BTreeMap::new();
+
         // handle regular containers
         let containers = spec.map(|s| s.containers.clone()).unwrap_or_default();
         for container in containers.into_iter() {
             if let Some(requirements) = container.resources {
+                let location = Location {
+                    node_name: node_name.clone(),
+                    namespace: metadata.namespace.clone(),
+                    pod_name: metadata.name.clone(),
+                    app_name: metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get("app").cloned()),
+                    container_name: Some(container.name.clone()),
+                };
                 if let Some(r) = requirements.requests {
-                    process_resources(&mut resource_requests, &r, std::ops::Add::add)?
+                    let mut container_resource_requests: BTreeMap<_, _> = BTreeMap::new();
+                    process_resources(&mut container_resource_requests, &r, std::ops::Add::add)?;
+                    push_resources(
+                        resources,
+                        &location,
+                        ResourceQualifier::Requested,
+                        &container_resource_requests,
+                    )?;
                 }
                 if let Some(r) = requirements.limits {
-                    process_resources(&mut resource_limits, &r, std::ops::Add::add)?;
+                    let mut container_resource_requests: BTreeMap<_, _> = BTreeMap::new();
+                    process_resources(&mut container_resource_requests, &r, std::ops::Add::add)?;
+                    push_resources(
+                        resources,
+                        &location,
+                        ResourceQualifier::Limit,
+                        &container_resource_requests,
+                    )?;
                 }
             }
         }
@@ -376,32 +394,43 @@ pub async fn extract_allocatable_from_pods(
             .unwrap_or_default();
         for container in init_containers.into_iter() {
             if let Some(requirements) = container.resources {
+                let container = Location {
+                    node_name: node_name.clone(),
+                    namespace: metadata.namespace.clone(),
+                    pod_name: metadata.name.clone(),
+                    app_name: metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get("app").cloned()),
+                    container_name: Some(container.name.clone()),
+                };
                 if let Some(r) = requirements.requests {
-                    process_resources(&mut resource_requests, &r, std::cmp::max)?;
+                    let mut container_resource_requests: BTreeMap<_, _> = BTreeMap::new();
+                    process_resources(&mut container_resource_requests, &r, std::ops::Add::add)?;
+                    push_resources(
+                        resources,
+                        &container,
+                        ResourceQualifier::Requested,
+                        &container_resource_requests,
+                    )?;
                 }
                 if let Some(r) = requirements.limits {
-                    process_resources(&mut resource_limits, &r, std::cmp::max)?;
+                    let mut container_resource_limits: BTreeMap<_, _> = BTreeMap::new();
+                    process_resources(&mut container_resource_limits, &r, std::ops::Add::add)?;
+                    push_resources(
+                        resources,
+                        &container,
+                        ResourceQualifier::Limit,
+                        &container_resource_limits,
+                    )?;
                 }
             }
         }
-        // handler overhead (add to both requests and limits)
-        if let Some(ref overhead) = spec.and_then(|s| s.overhead.clone()) {
-            process_resources(&mut resource_requests, overhead, std::ops::Add::add)?;
-            process_resources(&mut resource_limits, overhead, std::ops::Add::add)?;
-        }
-        // push these onto resources
-        push_resources(
-            resources,
-            &location,
-            ResourceQualifier::Requested,
-            &resource_requests,
-        )?;
-        push_resources(
-            resources,
-            &location,
-            ResourceQualifier::Limit,
-            &resource_limits,
-        )?;
+        // // handler overhead (add to both requests and limits)
+        // if let Some(ref overhead) = spec.and_then(|s| s.overhead.clone()) {
+        //     process_resources(&mut resource_requests, overhead, std::ops::Add::add)?;
+        //     process_resources(&mut resource_limits, overhead, std::ops::Add::add)?;
+        // }
     }
     Ok(())
 }
@@ -505,7 +534,9 @@ pub async fn extract_utilizations_from_pod_metrics(
 pub enum GroupBy {
     resource,
     node,
+    app,
     pod,
+    container,
     namespace,
 }
 
@@ -514,7 +545,9 @@ impl GroupBy {
         match self {
             Self::resource => Self::extract_kind,
             Self::node => Self::extract_node_name,
+            Self::app => Self::extract_app_name,
             Self::pod => Self::extract_pod_name,
+            Self::container => Self::extract_container_name,
             Self::namespace => Self::extract_namespace,
         }
     }
@@ -527,12 +560,30 @@ impl GroupBy {
         e.location.node_name.clone()
     }
 
+    fn extract_app_name(e: &Resource) -> Option<String> {
+        // TODO: This check was copy-pasta, does it make sense at all?
+        // We do not need to display "apps" resource types when grouping by apps
+        if e.kind == "apps" {
+            return None;
+        }
+        e.location.app_name.clone()
+    }
+
     fn extract_pod_name(e: &Resource) -> Option<String> {
         // We do not need to display "pods" resource types when grouping by pods
         if e.kind == "pods" {
             return None;
         }
         e.location.pod_name.clone()
+    }
+
+    fn extract_container_name(e: &Resource) -> Option<String> {
+        // TODO: This check was copy-pasta, does it make sense at all?
+        // We do not need to display "containers" resource types when grouping by containers
+        if e.kind == "containers" {
+            return None;
+        }
+        e.location.container_name.clone()
     }
 
     fn extract_namespace(e: &Resource) -> Option<String> {
@@ -545,7 +596,9 @@ impl std::fmt::Display for GroupBy {
         let s = match self {
             Self::resource => "resource",
             Self::node => "node",
+            Self::app => "app",
             Self::pod => "pod",
+            Self::container => "container",
             Self::namespace => "namespace",
         };
         f.write_str(s)
